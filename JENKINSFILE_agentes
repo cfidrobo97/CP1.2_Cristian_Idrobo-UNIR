@@ -6,7 +6,7 @@ pipeline {
   }
 
   stages {
-    
+
 
     stage('Get Code') {
       agent { label 'win-a1' }
@@ -18,7 +18,7 @@ pipeline {
           echo %WORKSPACE%
         '''
         //Descargar el repositorio
-        git branch: 'master',
+        git branch: 'feature_fix_coverage',
           credentialsId: 'github-pat',
           url: 'https://github.com/cfidrobo97/CP1.2_Cristian_Idrobo-UNIR.git'
         // Compartir el código con otros agentes/etapas
