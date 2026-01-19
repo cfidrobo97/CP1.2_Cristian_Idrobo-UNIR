@@ -1,0 +1,327 @@
+pipeline {
+  agent none
+  options {
+    skipDefaultCheckout(true)
+    timestamps()
+  }
+
+  stages {
+
+    stage('Get Code') {
+      agent { label 'win-a1' }
+      steps {
+        bat '''
+          echo === AGENT INFO (Get Code) ===
+          whoami
+          hostname
+          echo %WORKSPACE%
+        '''
+        //Descargar el repositorio
+        git branch: 'master',
+          credentialsId: 'github-pat',
+          url: 'https://github.com/cfidrobo97/CP1.2_Cristian_Idrobo-UNIR.git'
+        // Compartir el código con otros agentes/etapas
+        stash name: 'src', includes: '**/*', useDefaultExcludes: false
+      }
+      post {
+        always {
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Unit') {
+      agent { label 'win-a1' }
+      steps {
+        unstash 'src'
+        bat '''
+          echo === AGENT INFO (Unit) ===
+          whoami
+          hostname
+          echo %WORKSPACE%
+        '''
+        // Ejecución unica de Unit
+        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+          bat '''
+            del /q .coverage 2>NUL
+            set PYTHONPATH=%WORKSPACE%
+
+            coverage run --branch -m pytest --junitxml=result-unit.xml test\\unit
+          '''
+        }
+        //Publicar los resultados
+        junit 'result-unit.xml'
+
+        // Guardamos .coverage para usarlo en Coverage sin re-ejecutar tests
+        stash name: 'unit-artifacts', includes: '.coverage, result-unit.xml'
+      }
+      post {
+        always {
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Rest') {
+      agent { label 'win-a2' }
+      steps {
+        unstash 'src'
+
+        bat '''
+          echo === AGENT INFO (Rest) ===
+          whoami
+          hostname
+          echo %WORKSPACE%
+        '''
+        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+          bat '''
+            set FLASK_APP=app\\api.py
+            set FLASK_ENV=development
+    
+            start /B flask run > NUL 2>&1
+            start /B java -jar C:\\WIREMOCK\\wiremock-standalone-3.13.2.jar --port 9090 --root-dir test\\wiremock > NUL 2>&1
+          '''
+          sleep time: 3, unit: 'SECONDS'
+    
+          bat '''
+            set PYTHONPATH=%WORKSPACE%
+            pytest --junitxml=result-rest.xml test\\rest
+          '''
+        }
+        //Publicar los resultados
+        junit 'result-rest.xml'
+      }
+      post {
+        always {
+          // detener procesos levantados en Rest
+          bat '''
+            echo === STOP SERVICES (Rest) ===
+            
+            REM Liberar Puerto 5000 (Flask)
+            for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5000 ^| findstr LISTENING') do taskkill /F /PID %%a /T 2>NUL
+
+            REM Liberar Puerto 9090 (Wiremock)
+            for /f "tokens=5" %%a in ('netstat -aon ^| findstr :9090 ^| findstr LISTENING') do taskkill /F /PID %%a /T 2>NUL
+
+            exit /b 0
+          '''
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Quality') {
+      parallel {
+
+        stage('Static') {
+          agent { label 'win-a2' }
+          steps {
+            unstash 'src'
+
+            bat '''
+              echo === AGENT INFO (Quality/Static) ===
+              whoami
+              hostname
+              echo %WORKSPACE%
+            '''
+            script {
+              // Flake8: el estado se decide por # hallazgos
+              bat 'flake8 app --format=default > flake8.txt || exit 0'
+
+              recordIssues(
+                tools: [flake8(pattern: 'flake8.txt')],
+                name: 'Flake8 Analysis'
+              )
+
+              def flake8Out = readFile('flake8.txt').trim()
+              def count = flake8Out ? flake8Out.readLines().count { it?.trim() } : 0
+
+              echo "Total de hallazgos detectados (Flake8): ${count}"
+
+              if (count >= 10) {
+                currentBuild.result = 'FAILURE'
+                echo "Estado: Unhealthy (Rojo) por alcanzar ${count} errores."
+              } else if (count >= 8) {
+                if (currentBuild.result != 'FAILURE') currentBuild.result = 'UNSTABLE'
+                echo "Estado: Unstable (Amarillo) por alcanzar ${count} errores."
+              } else {
+                echo "Estado: OK (Verde)"
+              }
+            }
+          }
+          post {
+            always {
+              cleanWs()
+            }
+          }
+        }
+
+        stage('Security Test') {
+          agent { label 'win-a3' }
+          steps {
+            unstash 'src'
+
+            bat '''
+              echo === AGENT INFO (Quality/Security Test) ===
+              whoami
+              hostname
+              echo %WORKSPACE%
+            '''
+            script {
+              // Bandit: el estado se decide por # hallazgos
+              bat 'bandit -r app -f json -o bandit.json || exit 0'
+              bat 'bandit -r app -f txt  -o bandit_results.txt || exit 0'
+
+              recordIssues(
+                tools: [issues(pattern: 'bandit.json', name: 'Bandit')],
+                id: 'bandit-security'
+              )
+
+              archiveArtifacts artifacts: 'bandit.json, bandit_results.txt', fingerprint: true
+
+              // Conteo de issues desde el reporte TXT
+              def out = readFile('bandit_results.txt')
+              def count = out.readLines().count { it.contains('>> Issue:') }
+
+              echo "Total de hallazgos de seguridad (Bandit): ${count}"
+
+              if (count >= 4) {
+                currentBuild.result = 'FAILURE'
+                echo "Estado: Unhealthy (Rojo) por ${count} vulnerabilidades."
+              } else if (count >= 2) {
+                if (currentBuild.result != 'FAILURE') currentBuild.result = 'UNSTABLE'
+                echo "Estado: Unstable (Amarillo) por ${count} vulnerabilidades."
+              } else {
+                echo "Estado: OK (Verde)"
+              }
+            }
+          }
+          post {
+            always {
+              cleanWs()
+            }
+          }
+        }
+
+      }
+    }
+
+    stage('Performance') {
+      agent { label 'win-a3' }
+      steps {
+        unstash 'src'
+
+        bat '''
+          echo === AGENT INFO (Performance) ===
+          whoami
+          hostname
+          echo %WORKSPACE%
+        '''
+        script {
+
+          // Performance: levanta Flask y ejecuta JMeter con el archivo cp12.jmx
+          bat '''
+            if exist jmeter-report rmdir /s /q jmeter-report
+            if exist jmeter-results.jtl del /q jmeter-results.jtl 
+         
+            set FLASK_APP=app\\api.py
+            set FLASK_ENV=development
+            start /B flask run
+          '''
+    
+
+          sleep time: 5, unit: 'SECONDS'
+    
+          // Ejecutamos JMeter en modo no-GUI
+          bat '''
+            "C:\\jmeter-apache\\apache-jmeter-5.6.3\\bin\\jmeter.bat" ^
+              -n ^
+              -t test\\jmeter\\cp12.jmx ^
+              -l jmeter-results.jtl ^
+              -e -o jmeter-report
+          '''
+    
+          // Evidencia + reporte en Jenkins (plugin performance)
+          archiveArtifacts artifacts: 'jmeter-results.jtl, jmeter-report/**', fingerprint: true
+          perfReport 'jmeter-results.jtl'
+        }
+      }
+      post {
+        always {
+
+          bat '''
+            echo === STOP SERVICES (Performance) ===
+            
+            REM Liberar Puerto 5000 (Flask)
+            for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5000 ^| findstr LISTENING') do taskkill /F /PID %%a /T 2>NUL
+
+            exit /b 0
+          '''
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Coverage') {
+      agent { label 'win-a1' }
+      steps {
+        unstash 'src'
+        // Usa el .coverage sin re-ejecutar unit tests
+        unstash 'unit-artifacts'
+        bat '''
+          echo === AGENT INFO (Coverage) ===
+          whoami
+          hostname
+          echo %WORKSPACE%
+        '''
+
+        script {
+          // Genera reportes desde el .coverage ya creado
+          bat '''
+            coverage json -o coverage.json
+            coverage xml -o coverage.xml
+          '''
+          recordCoverage(
+            tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+            id: 'coverage',
+            name: 'Coverage Report'
+          )
+
+          archiveArtifacts artifacts: 'coverage.json, coverage.xml', fingerprint: true
+
+          def cov = readJSON file: 'coverage.json'
+
+          // Líneas
+          def linePct = cov.totals.percent_covered
+
+          // Ramas
+          def branchesTotal = cov.totals.num_branches ?: 0
+          def branchesCovered = cov.totals.covered_branches ?: 0
+          def branchPct = (branchesTotal > 0) ? (branchesCovered * 100.0 / branchesTotal) : 100.0
+
+          echo String.format("Coverage líneas: %.2f%% | Coverage ramas: %.2f%%", linePct, branchPct)
+
+          //Reglas Baremo
+          def lineState = (linePct < 85) ? 'RED' : (linePct < 95) ? 'YELLOW' : 'GREEN'
+          def branchState = (branchPct < 80) ? 'RED' : (branchPct < 90) ? 'YELLOW' : 'GREEN'
+
+          if (lineState == 'RED' || branchState == 'RED') {
+            currentBuild.result = 'FAILURE'
+            echo "Estado Coverage: Unhealthy (Rojo)"
+          } else if (lineState == 'YELLOW' || branchState == 'YELLOW') {
+            if (currentBuild.result != 'FAILURE') currentBuild.result = 'UNSTABLE'
+            echo "Estado Coverage: Unstable (Amarillo)"
+          } else {
+            echo "Estado Coverage: OK (Verde)"
+          }
+        }
+      }
+      post {
+        always {
+          cleanWs()
+        }
+      }
+    }
+    
+  }
+}
